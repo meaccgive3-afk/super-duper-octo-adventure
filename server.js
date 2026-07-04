@@ -6,8 +6,7 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     Browsers,
-    makeCacheableSignalKeyStore,
-    makeInMemoryStore
+    makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const cron = require('node-cron');
@@ -16,13 +15,79 @@ const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
+const os = require('os');
 
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: Infinity, maxFreeSockets: 1024, timeout: 30000, scheduling: 'lifo' });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: Infinity, maxFreeSockets: 1024, timeout: 30000, scheduling: 'lifo' });
+const agentOptions = {
+    keepAlive: true,
+    keepAliveMsecs: 10000,
+    maxSockets: Infinity,
+    maxFreeSockets: 2048,
+    timeout: 60000,
+    scheduling: 'lifo'
+};
+const httpAgent = new http.Agent(agentOptions);
+const httpsAgent = new https.Agent(agentOptions);
 
-class SecurityShield {
+class AsyncMutex {
+    constructor() {
+        this.queue = [];
+        this.locked = false;
+    }
+    async acquire() {
+        if (!this.locked) {
+            this.locked = true;
+            return;
+        }
+        return new Promise(resolve => this.queue.push(resolve));
+    }
+    release() {
+        if (this.queue.length > 0) {
+            const next = this.queue.shift();
+            setImmediate(next);
+        } else {
+            this.locked = false;
+        }
+    }
+}
+
+class MemoryGuardian {
+    static start(interval = 60000, thresholdMB = 1024) {
+        setInterval(() => {
+            const usage = process.memoryUsage();
+            const rssMB = Math.round(usage.rss / 1024 / 1024);
+            if (rssMB > thresholdMB) {
+                if (global.gc) {
+                    global.gc();
+                }
+            }
+        }, interval).unref();
+    }
+}
+
+class AdvancedRateLimiter {
+    constructor(windowMs, maxRequests) {
+        this.windowMs = windowMs;
+        this.maxRequests = maxRequests;
+        this.clients = new Map();
+        setInterval(() => this.clients.clear(), this.windowMs).unref();
+    }
+    middleware() {
+        return (req, res, next) => {
+            const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+            const current = this.clients.get(ip) || 0;
+            if (current >= this.maxRequests) {
+                return res.status(429).json({ error: 'Too Many Requests' });
+            }
+            this.clients.set(ip, current + 1);
+            next();
+        };
+    }
+}
+
+class QuantumSecurity {
     static protect(req, res, next) {
-        res.setHeader('X-Powered-By', 'Quantum-Core-Engine-v10-Ultra');
+        res.setHeader('X-Powered-By', 'Quantum-Nexus-Core-v11-Ultra');
         res.setHeader('X-Content-Type-Options', 'nosniff');
         res.setHeader('X-Frame-Options', 'DENY');
         res.setHeader('X-XSS-Protection', '1; mode=block');
@@ -31,19 +96,38 @@ class SecurityShield {
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
         res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
         res.removeHeader('Server');
+        if (req.method === 'OPTIONS') {
+            return res.sendStatus(204);
+        }
+        next();
+    }
+    static compress(req, res, next) {
+        const acceptEncoding = req.headers['accept-encoding'] || '';
+        if (!acceptEncoding.match(/\b(gzip|deflate)\b/)) return next();
+        const rawSend = res.send;
+        res.send = function (body) {
+            if (typeof body === 'string' || Buffer.isBuffer(body)) {
+                res.setHeader('Content-Encoding', acceptEncoding.includes('gzip') ? 'gzip' : 'deflate');
+                const compressed = acceptEncoding.includes('gzip') ? zlib.gzipSync(body) : zlib.deflateSync(body);
+                return rawSend.call(this, compressed);
+            }
+            return rawSend.call(this, body);
+        };
         next();
     }
 }
 
 class CircuitBreaker {
-    constructor(failureThreshold = 3, resetTimeout = 20000) {
+    constructor(failureThreshold = 3, resetTimeout = 15000) {
         this.failureThreshold = failureThreshold;
         this.resetTimeout = resetTimeout;
         this.failures = 0;
         this.state = 'CLOSED';
         this.nextAttempt = Date.now();
-        this.lock = false;
+        this.mutex = new AsyncMutex();
     }
     async execute(action) {
         if (this.state === 'OPEN') {
@@ -53,17 +137,16 @@ class CircuitBreaker {
                 throw new Error('CIRCUIT_OPEN');
             }
         }
-        while (this.lock) await new Promise(r => setImmediate(r));
-        this.lock = true;
+        await this.mutex.acquire();
         try {
             const result = await action();
             this.reset();
-            this.lock = false;
             return result;
         } catch (error) {
             this.recordFailure();
-            this.lock = false;
             throw error;
+        } finally {
+            this.mutex.release();
         }
     }
     recordFailure() {
@@ -79,8 +162,18 @@ class CircuitBreaker {
     }
 }
 
+class TimeoutWrapper {
+    static async execute(promise, timeoutMs) {
+        let timer;
+        const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('OPERATION_TIMEOUT')), timeoutMs);
+        });
+        return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+    }
+}
+
 class RetryStrategy {
-    static async execute(fn, maxRetries = 10, baseDelay = 200) {
+    static async execute(fn, maxRetries = 15, baseDelay = 150, maxDelay = 15000) {
         let attempt = 0;
         while (attempt < maxRetries) {
             try {
@@ -88,8 +181,8 @@ class RetryStrategy {
             } catch (error) {
                 attempt++;
                 if (attempt >= maxRetries) throw error;
-                const jitter = crypto.randomInt(50, 300);
-                const delay = Math.min(baseDelay * Math.pow(1.5, attempt) + jitter, 10000);
+                const jitter = crypto.randomInt(10, 200);
+                const delay = Math.min(baseDelay * Math.pow(1.6, attempt) + jitter, maxDelay);
                 await new Promise(res => setTimeout(res, delay));
             }
         }
@@ -99,7 +192,7 @@ class RetryStrategy {
 class AdvancedJobScheduler {
     constructor() {
         this.jobs = new Map();
-        this.metrics = { executed: 0, failed: 0, active: 0 };
+        this.metrics = { executed: 0, failed: 0, active: 0, lastExecution: null };
     }
     schedule(cronExpression, timezone, task, jobId) {
         if (this.jobs.has(jobId)) {
@@ -110,6 +203,7 @@ class AdvancedJobScheduler {
             try {
                 await task();
                 this.metrics.executed++;
+                this.metrics.lastExecution = Date.now();
             } catch (error) {
                 this.metrics.failed++;
             }
@@ -137,29 +231,31 @@ class WhatsAppConnectionManager extends EventEmitter {
         this.reconnectAttempts = 0;
         this.msgRetryCounterCache = new Map();
         this.logger = pino({ level: 'silent' });
-        this.circuitBreaker = new CircuitBreaker(5, 15000);
-        this.connectionLock = false;
-        this.store = makeInMemoryStore({ logger: this.logger });
+        this.circuitBreaker = new CircuitBreaker(5, 12000);
+        this.mutex = new AsyncMutex();
+        this.sessionPath = './whatsapp_session';
     }
     
     async getValidSocket() {
         if (!this.sock || !this.sock.user) {
             await this.initialize();
         }
-        let waitTime = 0;
-        while (this.isConnecting && waitTime < 45000) {
-            await new Promise(r => setTimeout(r, 50));
-            waitTime += 50;
-        }
+        await TimeoutWrapper.execute(this.waitForReadyState(), 45000);
         if (!this.sock) throw new Error('SOCKET_UNAVAILABLE');
         return this.sock;
+    }
+
+    async waitForReadyState() {
+        while (this.isConnecting) {
+            await new Promise(r => setTimeout(r, 50));
+        }
     }
 
     async waitForOpenConnection() {
         let waitTime = 0;
         while ((!this.sock || !this.sock.user) && waitTime < 60000) {
-            await new Promise(r => setTimeout(r, 200));
-            waitTime += 200;
+            await new Promise(r => setTimeout(r, 100));
+            waitTime += 100;
         }
         if (!this.sock || !this.sock.user) throw new Error('CONNECTION_TIMEOUT');
         return this.sock;
@@ -179,20 +275,27 @@ class WhatsAppConnectionManager extends EventEmitter {
         }
     }
 
-    async initialize() {
-        while (this.connectionLock) await new Promise(r => setTimeout(r, 10));
-        if (this.isConnecting) return;
-        this.connectionLock = true;
-        this.isConnecting = true;
-        
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-
+    async cleanSession() {
         try {
+            if (fs.existsSync(this.sessionPath)) {
+                fs.rmSync(this.sessionPath, { recursive: true, force: true });
+            }
+        } catch (e) {}
+    }
+
+    async initialize() {
+        await this.mutex.acquire();
+        try {
+            if (this.isConnecting) return;
+            this.isConnecting = true;
+            
+            if (this.reconnectTimer) {
+                clearTimeout(this.reconnectTimer);
+                this.reconnectTimer = null;
+            }
+
             await this.destroySocket();
-            const { state, saveCreds } = await useMultiFileAuthState('./whatsapp_session');
+            const { state, saveCreds } = await useMultiFileAuthState(this.sessionPath);
             const { version } = await fetchLatestBaileysVersion();
             
             this.sock = makeWASocket({
@@ -207,17 +310,16 @@ class WhatsAppConnectionManager extends EventEmitter {
                 generateHighQualityLinkPreview: true,
                 syncFullHistory: false,
                 markOnlineOnConnect: true,
-                connectTimeoutMs: 60000,
-                defaultQueryTimeoutMs: 60000,
-                keepAliveIntervalMs: 20000,
-                retryRequestDelayMs: 250,
-                maxMsgRetryCount: 25,
+                connectTimeoutMs: 120000,
+                defaultQueryTimeoutMs: 120000,
+                keepAliveIntervalMs: 15000,
+                retryRequestDelayMs: 150,
+                maxMsgRetryCount: 50,
                 msgRetryCounterCache: this.msgRetryCounterCache,
                 agent: httpsAgent,
                 getMessage: async () => ({ conversation: 'whatsapp-auto-call' })
             });
 
-            this.store.bind(this.sock.ev);
             this.sock.ev.on('creds.update', saveCreds);
             
             this.sock.ev.on('connection.update', async (update) => {
@@ -227,7 +329,7 @@ class WhatsAppConnectionManager extends EventEmitter {
                     const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                     if (shouldReconnect) {
                         this.reconnectAttempts++;
-                        const delay = Math.min(500 * Math.pow(1.2, this.reconnectAttempts) + crypto.randomInt(100, 300), 10000);
+                        const delay = Math.min(200 * Math.pow(1.5, this.reconnectAttempts) + crypto.randomInt(50, 200), 15000);
                         if (!this.reconnectTimer) {
                             this.reconnectTimer = setTimeout(async () => {
                                 this.reconnectTimer = null;
@@ -235,15 +337,13 @@ class WhatsAppConnectionManager extends EventEmitter {
                             }, delay);
                         }
                     } else {
-                        if (fs.existsSync('./whatsapp_session')) {
-                            fs.rmSync('./whatsapp_session', { recursive: true, force: true });
-                        }
+                        await this.cleanSession();
                         this.reconnectAttempts = 0;
                         if (!this.reconnectTimer) {
                             this.reconnectTimer = setTimeout(async () => {
                                 this.reconnectTimer = null;
                                 await this.initialize();
-                            }, 1000);
+                            }, 500);
                         }
                     }
                 } else if (connection === 'open') {
@@ -256,22 +356,27 @@ class WhatsAppConnectionManager extends EventEmitter {
                 this.reconnectTimer = setTimeout(async () => {
                     this.reconnectTimer = null;
                     await this.initialize();
-                }, 3000);
+                }, 2000);
             }
         } finally {
             this.isConnecting = false;
-            this.connectionLock = false;
+            this.mutex.release();
         }
     }
 }
 
+MemoryGuardian.start();
+
 const app = express();
 const waManager = new WhatsAppConnectionManager();
 const jobScheduler = new AdvancedJobScheduler();
+const apiRateLimiter = new AdvancedRateLimiter(60000, 1000);
 
-app.use(SecurityShield.protect);
-app.use(express.json({ limit: '50mb', strict: false }));
-app.use(express.urlencoded({ extended: true, limit: '50mb', parameterLimit: 100000 }));
+app.use(QuantumSecurity.protect);
+app.use(QuantumSecurity.compress);
+app.use(apiRateLimiter.middleware());
+app.use(express.json({ limit: '100mb', strict: false }));
+app.use(express.urlencoded({ extended: true, limit: '100mb', parameterLimit: 200000 }));
 app.use(express.static('public', { maxAge: '1d' }));
 
 app.post('/api/request-code', async (req, res) => {
@@ -280,7 +385,7 @@ app.post('/api/request-code', async (req, res) => {
     
     try {
         const socket = await waManager.getValidSocket();
-        await waManager.waitForOpenConnection();
+        await TimeoutWrapper.execute(waManager.waitForOpenConnection(), 60000);
         
         console.log({
             phoneNumber,
@@ -293,13 +398,16 @@ app.post('/api/request-code', async (req, res) => {
             return code?.match(/.{1,4}/g)?.join('-') || code;
         };
         
-        const code = await waManager.circuitBreaker.execute(() => RetryStrategy.execute(executeRequest, 7, 500));
+        const code = await waManager.circuitBreaker.execute(() => 
+            TimeoutWrapper.execute(RetryStrategy.execute(executeRequest, 10, 300), 30000)
+        );
         res.json({ success: true, code: code });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ 
+        res.status(500).json({
+            success: false,
             error: error.message,
-            stack: error.stack 
+            data: error
         });
     }
 });
@@ -317,7 +425,7 @@ app.post('/api/schedule-call', (req, res) => {
     const executionTask = async () => {
         try {
             const socket = await waManager.getValidSocket();
-            await waManager.waitForOpenConnection();
+            await TimeoutWrapper.execute(waManager.waitForOpenConnection(), 60000);
             
             const jid = targetNumber.includes('@s.whatsapp.net') ? targetNumber : `${targetNumber}@s.whatsapp.net`;
             const makeCallRequest = async () => {
@@ -327,7 +435,7 @@ app.post('/api/schedule-call', (req, res) => {
                     content: [{ tag: 'call', attrs: { action: 'init' } }]
                 });
             };
-            await RetryStrategy.execute(makeCallRequest, 35, 800);
+            await RetryStrategy.execute(makeCallRequest, 50, 500, 20000);
         } catch (e) {}
     };
 
@@ -343,16 +451,16 @@ const gracefulShutdown = async () => {
 
 process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+process.on('uncaughtException', (err) => { console.error('CRITICAL UNCAUGHT:', err); });
+process.on('unhandledRejection', (reason) => { console.error('CRITICAL UNHANDLED:', reason); });
 
 waManager.initialize().catch(() => {});
 
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 70000;
-server.maxConnections = 100000;
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
+server.maxConnections = Infinity;
 
 server.listen(PORT, '0.0.0.0', () => {});
