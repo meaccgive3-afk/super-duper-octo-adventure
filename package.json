@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-auto-call",
+  "version": "1.0.0",
+  "description": "نظام جدولة الاتصال التلقائي عبر الواتساب",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "pino": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
