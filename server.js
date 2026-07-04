@@ -1,93 +1,290 @@
 require('dotenv').config();
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    Browsers,
+    makeCacheableSignalKeyStore,
+    makeInMemoryStore
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const cron = require('node-cron');
 const fs = require('fs');
-const path = require('path');
+const crypto = require('crypto');
+const { EventEmitter } = require('events');
+const http = require('http');
+const https = require('https');
+const os = require('os');
+
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+
+class CircuitBreaker {
+    constructor(failureThreshold, resetTimeout) {
+        this.failureThreshold = failureThreshold;
+        this.resetTimeout = resetTimeout;
+        this.failures = 0;
+        this.state = 'CLOSED';
+        this.nextAttempt = Date.now();
+    }
+    
+    async execute(action) {
+        if (this.state === 'OPEN') {
+            if (Date.now() > this.nextAttempt) {
+                this.state = 'HALF_OPEN';
+            } else {
+                throw new Error('Circuit Breaker is OPEN');
+            }
+        }
+        try {
+            const result = await action();
+            this.reset();
+            return result;
+        } catch (error) {
+            this.recordFailure();
+            throw error;
+        }
+    }
+    
+    recordFailure() {
+        this.failures += 1;
+        if (this.failures >= this.failureThreshold) {
+            this.state = 'OPEN';
+            this.nextAttempt = Date.now() + this.resetTimeout;
+        }
+    }
+    
+    reset() {
+        this.failures = 0;
+        this.state = 'CLOSED';
+    }
+}
+
+class RetryStrategy {
+    static async execute(fn, maxRetries = 5, baseDelay = 1000) {
+        let attempt = 0;
+        while (attempt < maxRetries) {
+            try {
+                return await fn();
+            } catch (error) {
+                attempt++;
+                if (attempt >= maxRetries) throw error;
+                const jitter = Math.random() * 500;
+                const delay = Math.min(baseDelay * Math.pow(2, attempt) + jitter, 30000);
+                await new Promise(res => setTimeout(res, delay));
+            }
+        }
+    }
+}
+
+class AdvancedJobScheduler {
+    constructor() {
+        this.jobs = new Map();
+        this.metrics = { executed: 0, failed: 0 };
+    }
+
+    schedule(cronExpression, timezone, task, jobId) {
+        if (this.jobs.has(jobId)) {
+            this.jobs.get(jobId).stop();
+            this.jobs.delete(jobId);
+        }
+
+        const wrappedTask = async () => {
+            try {
+                await task();
+                this.metrics.executed++;
+            } catch (error) {
+                this.metrics.failed++;
+            }
+        };
+
+        const job = cron.schedule(cronExpression, wrappedTask, { scheduled: true, timezone });
+        this.jobs.set(jobId, { job, expression: cronExpression, createdAt: Date.now() });
+        return jobId;
+    }
+
+    cleanup() {
+        for (const [id, jobData] of this.jobs.entries()) {
+            jobData.job.stop();
+            this.jobs.delete(id);
+        }
+    }
+}
+
+class WhatsAppConnectionManager extends EventEmitter {
+    constructor() {
+        super();
+        this.sock = null;
+        this.isConnecting = false;
+        this.reconnectTimer = null;
+        this.reconnectAttempts = 0;
+        this.store = makeInMemoryStore({ logger: pino().child({ level: 'silent', stream: 'store' }) });
+        this.store.readFromFile('./baileys_store_multi.json');
+        
+        setInterval(() => {
+            this.store.writeToFile('./baileys_store_multi.json');
+        }, 10000);
+        
+        this.msgRetryCounterCache = new Map();
+        this.logger = pino({ level: 'silent' });
+        this.circuitBreaker = new CircuitBreaker(5, 60000);
+    }
+
+    async getValidSocket() {
+        if (!this.sock || !this.sock.user) {
+            await this.initialize();
+        }
+        let waitTime = 0;
+        while (this.isConnecting && waitTime < 30000) {
+            await new Promise(r => setTimeout(r, 500));
+            waitTime += 500;
+        }
+        if (!this.sock) throw new Error('Socket initialization failed');
+        return this.sock;
+    }
+
+    async destroySocket() {
+        if (this.sock) {
+            try {
+                this.sock.ev.removeAllListeners();
+                this.sock.ws?.removeAllListeners();
+                if (this.sock.ws?.readyState === 1) {
+                    this.sock.ws.close();
+                }
+                this.sock.end?.();
+            } catch (e) {}
+            this.sock = null;
+        }
+    }
+
+    async initialize() {
+        if (this.isConnecting) return;
+        this.isConnecting = true;
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        try {
+            await this.destroySocket();
+
+            const { state, saveCreds } = await useMultiFileAuthState('./whatsapp_session');
+            const { version } = await fetchLatestBaileysVersion();
+
+            this.sock = makeWASocket({
+                version,
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, this.logger),
+                },
+                logger: this.logger,
+                printQRInTerminal: false,
+                browser: Browsers.macOS('Chrome'),
+                generateHighQualityLinkPreview: true,
+                syncFullHistory: false,
+                markOnlineOnConnect: true,
+                connectTimeoutMs: 120000,
+                defaultQueryTimeoutMs: 120000,
+                keepAliveIntervalMs: 25000,
+                retryRequestDelayMs: 2000,
+                maxMsgRetryCount: 15,
+                msgRetryCounterCache: this.msgRetryCounterCache,
+                agent: httpsAgent,
+                getMessage: async (key) => {
+                    const msg = await this.store.loadMessage(key.remoteJid, key.id);
+                    return msg?.message || { conversation: 'whatsapp-auto-call' };
+                }
+            });
+
+            this.store.bind(this.sock.ev);
+
+            this.sock.ev.on('creds.update', saveCreds);
+
+            this.sock.ev.on('connection.update', async (update) => {
+                const { connection, lastDisconnect } = update;
+                
+                if (connection === 'close') {
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+                    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                    
+                    if (shouldReconnect) {
+                        this.reconnectAttempts++;
+                        const jitter = Math.random() * 1000;
+                        const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts) + jitter, 60000);
+                        
+                        if (!this.reconnectTimer) {
+                            this.reconnectTimer = setTimeout(async () => {
+                                this.reconnectTimer = null;
+                                await this.initialize();
+                            }, delay);
+                        }
+                    } else {
+                        if (fs.existsSync('./whatsapp_session')) {
+                            fs.rmSync('./whatsapp_session', { recursive: true, force: true });
+                        }
+                        this.reconnectAttempts = 0;
+                        if (!this.reconnectTimer) {
+                            this.reconnectTimer = setTimeout(async () => {
+                                this.reconnectTimer = null;
+                                await this.initialize();
+                            }, 5000);
+                        }
+                    }
+                } else if (connection === 'open') {
+                    this.reconnectAttempts = 0;
+                    this.emit('connected', this.sock);
+                }
+            });
+
+        } catch (err) {
+            if (!this.reconnectTimer) {
+                this.reconnectTimer = setTimeout(async () => {
+                    this.reconnectTimer = null;
+                    await this.initialize();
+                }, 10000);
+            }
+        } finally {
+            this.isConnecting = false;
+        }
+    }
+}
 
 const app = express();
+const waManager = new WhatsAppConnectionManager();
+const jobScheduler = new AdvancedJobScheduler();
+
+const securityMiddleware = (req, res, next) => {
+    res.setHeader('X-Powered-By', 'Advanced-Enterprise-Engine');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
+};
+
+app.use(securityMiddleware);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static('public'));
-
-let sock;
-const logger = pino({ level: 'error' });
-
-process.on('uncaughtException', (err) => console.error(err));
-process.on('unhandledRejection', (err) => console.error(err));
-
-async function initializeWhatsApp() {
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState('./whatsapp_session');
-        const { version } = await fetchLatestBaileysVersion();
-
-        sock = makeWASocket({
-            version,
-            auth: state,
-            logger,
-            printQRInTerminal: false,
-            browser: Browsers.macOS('Chrome'),
-            generateHighQualityLinkPreview: true,
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 10000,
-            getMessage: async () => { return { conversation: 'whatsapp-auto-call' }; }
-        });
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
-            if (connection === 'close') {
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.error(`Connection closed. Reconnecting: ${shouldReconnect}`, lastDisconnect?.error);
-                if (shouldReconnect) {
-                    setTimeout(initializeWhatsApp, 3000);
-                } else {
-                    if (fs.existsSync('./whatsapp_session')) {
-                        fs.rmSync('./whatsapp_session', { recursive: true, force: true });
-                    }
-                    setTimeout(initializeWhatsApp, 3000);
-                }
-            } else if (connection === 'open') {
-                console.log('WhatsApp connection securely opened.');
-            }
-        });
-
-        sock.ev.on('error', (err) => console.error('Baileys Error:', err));
-
-        return sock;
-    } catch (err) {
-        console.error('Initialization Error:', err);
-    }
-}
 
 app.post('/api/request-code', async (req, res) => {
     const { phoneNumber } = req.body;
     if (!phoneNumber) return res.status(400).json({ error: 'الرجاء إدخال رقم الهاتف' });
 
     try {
-        if (!sock || !sock.user) {
-            await initializeWhatsApp();
-        }
+        const socket = await waManager.getValidSocket();
+        
+        const executeRequest = async () => {
+            let code = await socket.requestPairingCode(phoneNumber);
+            return code?.match(/.{1,4}/g)?.join('-') || code;
+        };
 
-        setTimeout(async () => {
-            try {
-                let code = await sock.requestPairingCode(phoneNumber);
-                code = code?.match(/.{1,4}/g)?.join('-') || code;
-                res.json({ success: true, code: code });
-            } catch (err) {
-                console.error('Pairing Code Error:', err);
-                res.status(500).json({ error: 'فشل طلب الكود، تأكد من الرقم أو حاول لاحقاً' });
-            }
-        }, 3000);
-
+        const code = await waManager.circuitBreaker.execute(() => RetryStrategy.execute(executeRequest, 3, 2000));
+        res.json({ success: true, code: code });
     } catch (error) {
-        console.error('API Request Error:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'فشل طلب الكود، تأكد من الرقم أو حاول لاحقاً' });
     }
 });
 
@@ -100,40 +297,47 @@ app.post('/api/schedule-call', (req, res) => {
 
     const [hour, minute] = time.split(':');
     const cronExpression = `${minute} ${hour} * * *`;
+    const jobId = crypto.createHash('sha256').update(`${targetNumber}-${time}-${Date.now()}`).digest('hex');
 
-    cron.schedule(cronExpression, async () => {
+    const executionTask = async () => {
         try {
-            if (!sock || !sock.user) await initializeWhatsApp();
+            const socket = await waManager.getValidSocket();
+            const jid = targetNumber.includes('@s.whatsapp.net') ? targetNumber : `${targetNumber}@s.whatsapp.net`;
             
-            const jid = `${targetNumber}@s.whatsapp.net`;
-            let calling = true;
+            const makeCallRequest = async () => {
+                await socket.query({
+                    tag: 'iq',
+                    attrs: { to: jid, type: 'set', xmlns: 'w:g2' },
+                    content: [{ tag: 'call', attrs: { action: 'init' } }]
+                });
+            };
 
-            while (calling) {
-                try {
-                    await sock.query({
-                        tag: 'iq',
-                        attrs: { to: jid, type: 'set', xmlns: 'w:g2' },
-                        content: [{ tag: 'call', attrs: { action: 'init' } }]
-                    });
-                    
-                    await new Promise(r => setTimeout(r, 30000));
-                } catch (e) {
-                    console.error('Call Query Error:', e);
-                    await new Promise(r => setTimeout(r, 5000));
-                }
-            }
-        } catch (cronErr) {
-            console.error('Cron Execution Error:', cronErr);
-        }
-    }, {
-        scheduled: true,
-        timezone: "Africa/Cairo"
-    });
+            await RetryStrategy.execute(makeCallRequest, 15, 3000);
+        } catch (e) {}
+    };
+
+    jobScheduler.schedule(cronExpression, "Africa/Cairo", executionTask, jobId);
 
     res.json({ success: true, message: `تمت جدولة الاتصال بنجاح بتوقيت القاهرة الساعة ${time}` });
 });
 
-initializeWhatsApp().catch(err => console.error('Startup Error:', err));
+const gracefulShutdown = async () => {
+    jobScheduler.cleanup();
+    await waManager.destroySocket();
+    if (fs.existsSync('./baileys_store_multi.json')) {
+        waManager.store.writeToFile('./baileys_store_multi.json');
+    }
+    process.exit(0);
+};
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+process.on('uncaughtException', () => {});
+process.on('unhandledRejection', () => {});
+
+waManager.initialize().catch(() => {});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`السيرفر يعمل بنجاح على المنفذ ${PORT}`));
+const server = app.listen(PORT, () => {});
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 120500;
