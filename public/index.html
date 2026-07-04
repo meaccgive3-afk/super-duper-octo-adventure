@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>نظام الاتصال التلقائي</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --card-bg: #1e1e1e;
+            --input-bg: #2a2a2a;
+            --text-color: #ffffff;
+            --text-muted: #aaaaaa;
+            --primary-btn: #25D366;
+            --secondary-btn: #007bff;
+            --accent-color: #00ffcc;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 400px;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            border: 1px solid #2d2d2d;
+        }
+
+        h2 {
+            margin-top: 0;
+            margin-bottom: 25px;
+            font-size: 22px;
+            font-weight: 600;
+            text-align: center;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+            text-align: right;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+
+        input {
+            width: 100%;
+            padding: 12px;
+            background-color: var(--input-bg);
+            border: 1px solid #3d3d3d;
+            border-radius: 6px;
+            color: var(--text-color);
+            font-size: 15px;
+            box-sizing: border-box;
+            transition: border-color 0.3s;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--secondary-btn);
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 6px;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        .btn-whatsapp {
+            background-color: var(--primary-btn);
+            color: #fff;
+        }
+
+        .btn-schedule {
+            background-color: var(--secondary-btn);
+            color: #fff;
+            margin-top: 10px;
+        }
+
+        .code-display {
+            display: none;
+            font-family: monospace;
+            font-size: 26px;
+            color: var(--accent-color);
+            font-weight: bold;
+            letter-spacing: 3px;
+            margin: 20px 0;
+            padding: 15px;
+            background: #151515;
+            border-radius: 6px;
+            border: 1px dashed var(--accent-color);
+            text-align: center;
+        }
+
+        .instruction {
+            display: none;
+            font-size: 13px;
+            color: var(--text-muted);
+            line-height: 1.6;
+            background: #252525;
+            padding: 12px;
+            border-radius: 6px;
+            margin-top: 10px;
+            text-align: right;
+        }
+
+        hr {
+            border: 0;
+            height: 1px;
+            background: #2d2d2d;
+            margin: 25px 0;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="card">
+        <h2>اتصال الواتساب التلقائي</h2>
+        
+        <!-- القسم الأول: تسجيل دخول الحساب -->
+        <div class="form-group">
+            <label for="myNumber">رقم هاتف حسابك (كود الدولة بدون +):</label>
+            <input type="text" id="myNumber" placeholder="مثال: 201012345678">
+            <button onclick="requestCode()" class="btn-whatsapp" style="margin-top: 12px;">طلب رمز الربط</button>
+        </div>
+
+        <div id="codeResult" class="code-display"></div>
+        <div id="instruction" class="instruction">
+            💡 <strong>طريقة التفعيل:</strong> افتح واتساب على هاتفك ← خيارات (الثلاث نقاط) ← الأجهزة المرتبطة ← ربط جهاز ← اختر "الربط برقم الهاتف بدلاً من ذلك" ← اكتب الكود الموضح بالأعلى.
+        </div>
+
+        <hr>
+
+        <!-- القسم الثاني: جدولة المكالمة -->
+        <div class="form-group">
+            <label for="targetNumber">رقم الشخص المستهدف (كود الدولة بدون +):</label>
+            <input type="text" id="targetNumber" placeholder="مثال: 201112345678">
+        </div>
+
+        <div class="form-group">
+            <label for="callTime">وقت الاتصال (بتوقيت القاهرة):</label>
+            <input type="time" id="callTime">
+        </div>
+
+        <button onclick="scheduleCall()" class="btn-schedule">حفظ وجدولة الاتصال</button>
+    </div>
+</div>
+
+<script>
+    async function requestCode() {
+        const phoneNumber = document.getElementById('myNumber').value.trim();
+        if (!phoneNumber) {
+            alert('الرجاء إدخال رقم الهاتف أولاً');
+            return;
+        }
+
+        const codeResult = document.getElementById('codeResult');
+        const instruction = document.getElementById('instruction');
+
+        try {
+            codeResult.style.display = 'block';
+            codeResult.innerText = 'جاري التوليد...';
+            codeResult.style.color = '#aaaaaa';
+            codeResult.style.borderColor = '#3d3d3d';
+
+            const res = await fetch('/api/request-code', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phoneNumber })
+            });
+            
+            const data = await res.json();
+            
+            if (data.success) {
+                codeResult.innerText = data.code;
+                codeResult.style.color = 'var(--accent-color)';
+                codeResult.style.borderColor = 'var(--accent-color)';
+                instruction.style.display = 'block';
+            } else {
+                codeResult.style.display = 'none';
+                alert(data.error || 'حدث خطأ أثناء طلب الرمز');
+            }
+        } catch (error) {
+            codeResult.style.display = 'none';
+            alert('فشل الاتصال بالسيرفر');
+        }
+    }
+
+    async function scheduleCall() {
+        const targetNumber = document.getElementById('targetNumber').value.trim();
+        const time = document.getElementById('callTime').value;
+        
+        if (!targetNumber || !time) {
+            alert('الرجاء إدخال رقم الشخص المستهدف وتحديد الوقت');
+            return;
+        }
+
+        try {
+            const res = await fetch('/api/schedule-call', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ targetNumber, time })
+            });
+            const data = await res.json();
+            alert(data.message || data.error);
+        } catch (error) {
+            alert('فشل إرسال طلب الجدولة للسيرفر');
+        }
+    }
+</script>
+
+</body>
+</html>
