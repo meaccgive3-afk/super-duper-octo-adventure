@@ -1,52 +1,96 @@
 require('dotenv').config();
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const cron = require('node-cron');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
-app.use(express.json());
-app.use(express.static('public')); // يقرأ ملف index.html من مجلد public
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.static('public'));
 
 let sock;
-let authState;
+const logger = pino({ level: 'error' });
 
-// 1. طلب كود الربط (Pairing Code)
+process.on('uncaughtException', (err) => console.error(err));
+process.on('unhandledRejection', (err) => console.error(err));
+
+async function initializeWhatsApp() {
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState('./whatsapp_session');
+        const { version } = await fetchLatestBaileysVersion();
+
+        sock = makeWASocket({
+            version,
+            auth: state,
+            logger,
+            printQRInTerminal: false,
+            browser: Browsers.macOS('Chrome'),
+            generateHighQualityLinkPreview: true,
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,
+            getMessage: async () => { return { conversation: 'whatsapp-auto-call' }; }
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            if (connection === 'close') {
+                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                console.error(`Connection closed. Reconnecting: ${shouldReconnect}`, lastDisconnect?.error);
+                if (shouldReconnect) {
+                    setTimeout(initializeWhatsApp, 3000);
+                } else {
+                    if (fs.existsSync('./whatsapp_session')) {
+                        fs.rmSync('./whatsapp_session', { recursive: true, force: true });
+                    }
+                    setTimeout(initializeWhatsApp, 3000);
+                }
+            } else if (connection === 'open') {
+                console.log('WhatsApp connection securely opened.');
+            }
+        });
+
+        sock.ev.on('error', (err) => console.error('Baileys Error:', err));
+
+        return sock;
+    } catch (err) {
+        console.error('Initialization Error:', err);
+    }
+}
+
 app.post('/api/request-code', async (req, res) => {
     const { phoneNumber } = req.body;
     if (!phoneNumber) return res.status(400).json({ error: 'الرجاء إدخال رقم الهاتف' });
 
     try {
-        // تهيئة بيئة حفظ الجلسة لمرة واحدة
-        authState = await useMultiFileAuthState('./whatsapp_session');
-        
-        sock = makeWASocket({
-            auth: authState.state,
-            logger: pino({ level: 'silent' }),
-            browser: ["Ubuntu", "Chrome", "20.0.04"]
-        });
+        if (!sock || !sock.user) {
+            await initializeWhatsApp();
+        }
 
-        // حفظ التحديثات تلقائياً لملفات الجلسة
-        sock.ev.on('creds.update', authState.saveCreds);
-
-        // طلب الكود من سيرفرات واتساب
         setTimeout(async () => {
             try {
                 let code = await sock.requestPairingCode(phoneNumber);
                 code = code?.match(/.{1,4}/g)?.join('-') || code;
                 res.json({ success: true, code: code });
             } catch (err) {
+                console.error('Pairing Code Error:', err);
                 res.status(500).json({ error: 'فشل طلب الكود، تأكد من الرقم أو حاول لاحقاً' });
             }
         }, 3000);
 
     } catch (error) {
+        console.error('API Request Error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 2. جدولة المكالمة
 app.post('/api/schedule-call', (req, res) => {
     const { targetNumber, time } = req.body;
     
@@ -57,28 +101,29 @@ app.post('/api/schedule-call', (req, res) => {
     const [hour, minute] = time.split(':');
     const cronExpression = `${minute} ${hour} * * *`;
 
-    // جدولة المهمة بتوقيت القاهرة المتأثر بملف .env أو الاستضافة
     cron.schedule(cronExpression, async () => {
-        console.log(`بدء الاتصال التلقائي على الرقم: ${targetNumber}`);
-        
-        const jid = `${targetNumber}@s.whatsapp.net`;
-        let calling = true;
+        try {
+            if (!sock || !sock.user) await initializeWhatsApp();
+            
+            const jid = `${targetNumber}@s.whatsapp.net`;
+            let calling = true;
 
-        while (calling) {
-            try {
-                // إرسال طلب بدء الاتصال
-                await sock.query({
-                    tag: 'iq',
-                    attrs: { to: jid, type: 'set', xmlns: 'w:g2' },
-                    content: [{ tag: 'call', attrs: { action: 'init' } }]
-                });
-                
-                // الانتظار 30 ثانية قبل المحاولة التالية إذا لم يتم الرد
-                await new Promise(r => setTimeout(r, 30000));
-            } catch (e) {
-                console.log("تم رفض المكالمة أو حدث خطأ، إعادة المحاولة بعد 5 ثوانٍ...");
-                await new Promise(r => setTimeout(r, 5000));
+            while (calling) {
+                try {
+                    await sock.query({
+                        tag: 'iq',
+                        attrs: { to: jid, type: 'set', xmlns: 'w:g2' },
+                        content: [{ tag: 'call', attrs: { action: 'init' } }]
+                    });
+                    
+                    await new Promise(r => setTimeout(r, 30000));
+                } catch (e) {
+                    console.error('Call Query Error:', e);
+                    await new Promise(r => setTimeout(r, 5000));
+                }
             }
+        } catch (cronErr) {
+            console.error('Cron Execution Error:', cronErr);
         }
     }, {
         scheduled: true,
@@ -88,6 +133,7 @@ app.post('/api/schedule-call', (req, res) => {
     res.json({ success: true, message: `تمت جدولة الاتصال بنجاح بتوقيت القاهرة الساعة ${time}` });
 });
 
-// تشغيل السيرفر على المنفذ المحدد في .env أو 3000 كافتراضي
+initializeWhatsApp().catch(err => console.error('Startup Error:', err));
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`السيرفر يعمل بنجاح على المنفذ ${PORT}`));
